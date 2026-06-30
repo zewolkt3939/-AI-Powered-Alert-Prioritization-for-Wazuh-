@@ -1,0 +1,312 @@
+"""Alert correlation engine to group related alerts."""
+import hashlib
+import logging
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+logger = logging.getLogger(__name__)
+
+
+class AlertCorrelationEngine:
+    """
+    Correlate related alerts based on common attributes.
+    
+    Groups alerts by:
+    - Same source IP + same attack type
+    - Same destination + same attack type
+    - Same signature + time window
+    - Same rule pattern + time window
+    """
+    
+    def __init__(self, time_window_minutes: int = 15):
+        """
+        Initialize correlation engine.
+        
+        Args:
+            time_window_minutes: Time window for correlation (default: 15 minutes)
+        """
+        self.time_window_minutes = time_window_minutes
+        self.alert_groups: Dict[str, List[Dict[str, Any]]] = {}
+        self.group_metadata: Dict[str, Dict[str, Any]] = {}
+        self._cleanup_interval = timedelta(hours=1)
+        self._last_cleanup = datetime.utcnow()
+    
+    def _generate_group_key(
+        self,
+        alert: Dict[str, Any],
+        correlation_type: str = "source_attack"
+    ) -> Optional[str]:
+        """
+        Generate correlation key for grouping alerts.
+        
+        Args:
+            alert: Normalized alert dictionary
+            correlation_type: Type of correlation (source_attack, destination_attack, signature)
+            
+        Returns:
+            Group key string or None
+        """
+        rule = alert.get("rule", {})
+        agent = alert.get("agent", {})
+        http_context = alert.get("http")
+        suricata_alert = alert.get("suricata_alert")
+        
+        srcip = alert.get("srcip", "")
+        dstip = agent.get("ip", "")
+        rule_id = str(rule.get("id", ""))
+        
+        # Extract attack type from tags or rule groups
+        attack_type = None
+        rule_groups = rule.get("groups", [])
+        
+        # Priority: specific attack tags > rule groups
+        if "sql_injection" in rule_groups or "sqlinjection" in rule_groups:
+            attack_type = "sql_injection"
+        elif "command_injection" in rule_groups:
+            attack_type = "command_injection"
+        elif "xss" in rule_groups:
+            attack_type = "xss"
+        elif "path_traversal" in rule_groups:
+            attack_type = "path_traversal"
+        elif "web_attack" in rule_groups:
+            attack_type = "web_attack"
+        elif "bruteforce" in rule_groups or "authentication_failed" in rule_groups:
+            attack_type = "bruteforce"
+        elif "attack" in rule_groups:
+            attack_type = "attack"
+        
+        # Build correlation key based on type
+        if correlation_type == "source_attack":
+            if srcip and attack_type:
+                return f"src:{srcip}:attack:{attack_type}"
+        elif correlation_type == "destination_attack":
+            if dstip and attack_type:
+                return f"dst:{dstip}:attack:{attack_type}"
+        elif correlation_type == "signature":
+            if suricata_alert and suricata_alert.get("signature_id"):
+                sig_id = suricata_alert.get("signature_id")
+                return f"sig:{sig_id}"
+        elif correlation_type == "rule_pattern":
+            if rule_id:
+                return f"rule:{rule_id}"
+        
+        return None
+    
+    def _is_in_time_window(
+        self,
+        alert_timestamp: str,
+        group_timestamp: str,
+        window_minutes: int
+    ) -> bool:
+        """Check if alert is within time window of group."""
+        try:
+            alert_dt = datetime.fromisoformat(alert_timestamp.replace("Z", "+00:00"))
+            group_dt = datetime.fromisoformat(group_timestamp.replace("Z", "+00:00"))
+            
+            time_diff = abs((alert_dt - group_dt).total_seconds() / 60)
+            return time_diff <= window_minutes
+        except Exception:
+            return False
+    
+    def _cleanup_old_groups(self):
+        """Remove correlation groups older than cleanup interval."""
+        now = datetime.utcnow()
+        if (now - self._last_cleanup) < self._cleanup_interval:
+            return
+        
+        cutoff_time = now - timedelta(hours=2)  # Keep groups for 2 hours
+        
+        groups_to_remove = []
+        for group_key, metadata in self.group_metadata.items():
+            try:
+                group_time = datetime.fromisoformat(
+                    metadata.get("first_seen", "").replace("Z", "+00:00")
+                )
+                if group_time < cutoff_time:
+                    groups_to_remove.append(group_key)
+            except Exception:
+                groups_to_remove.append(group_key)
+        
+        for group_key in groups_to_remove:
+            self.alert_groups.pop(group_key, None)
+            self.group_metadata.pop(group_key, None)
+        
+        self._last_cleanup = now
+        logger.debug(
+            f"Cleaned up {len(groups_to_remove)} old correlation groups",
+            extra={
+                "component": "correlation",
+                "action": "cleanup",
+                "removed_groups": len(groups_to_remove)
+            }
+        )
+    
+    def correlate(self, alert: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Correlate alert with existing groups.
+        
+        Args:
+            alert: Normalized alert dictionary
+            
+        Returns:
+            Dict with correlation info:
+            - is_correlated: bool
+            - group_key: str (if correlated)
+            - group_size: int (number of alerts in group)
+            - first_seen: str (timestamp of first alert in group)
+            - attack_pattern: str (type of attack pattern)
+        """
+        self._cleanup_old_groups()
+        
+        timestamp = alert.get("@timestamp", "")
+        if not timestamp:
+            return {
+                "is_correlated": False,
+                "group_key": None,
+                "group_size": 1,
+                "first_seen": timestamp,
+                "attack_pattern": None
+            }
+        
+        # Try different correlation types (priority order)
+        correlation_types = ["source_attack", "destination_attack", "signature", "rule_pattern"]
+        
+        for corr_type in correlation_types:
+            group_key = self._generate_group_key(alert, corr_type)
+            if not group_key:
+                continue
+            
+            # Check if group exists and is within time window
+            if group_key in self.alert_groups:
+                group = self.alert_groups[group_key]
+                metadata = self.group_metadata[group_key]
+                
+                # Check time window
+                first_seen = metadata.get("first_seen", timestamp)
+                if self._is_in_time_window(timestamp, first_seen, self.time_window_minutes):
+                    # Add alert to group
+                    group.append(alert)
+                    metadata["last_seen"] = timestamp
+                    metadata["count"] = len(group)
+                    
+                    logger.debug(
+                        f"Alert correlated with existing group",
+                        extra={
+                            "component": "correlation",
+                            "action": "correlate",
+                            "group_key": group_key,
+                            "correlation_type": corr_type,
+                            "group_size": len(group)
+                        }
+                    )
+                    
+                    return {
+                        "is_correlated": True,
+                        "group_key": group_key,
+                        "group_size": len(group),
+                        "first_seen": first_seen,
+                        "attack_pattern": metadata.get("attack_pattern"),
+                        "correlation_type": corr_type
+                    }
+            
+            # Create new group
+            self.alert_groups[group_key] = [alert]
+            
+            # Extract attack pattern
+            rule = alert.get("rule", {})
+            rule_groups = rule.get("groups", [])
+            attack_pattern = None
+            if "sql_injection" in rule_groups or "sqlinjection" in rule_groups:
+                attack_pattern = "sql_injection"
+            elif "command_injection" in rule_groups:
+                attack_pattern = "command_injection"
+            elif "xss" in rule_groups:
+                attack_pattern = "xss"
+            elif "web_attack" in rule_groups:
+                attack_pattern = "web_attack"
+            elif "bruteforce" in rule_groups:
+                attack_pattern = "bruteforce"
+            
+            self.group_metadata[group_key] = {
+                "first_seen": timestamp,
+                "last_seen": timestamp,
+                "count": 1,
+                "attack_pattern": attack_pattern,
+                "correlation_type": corr_type
+            }
+        
+        return {
+            "is_correlated": False,
+            "group_key": None,
+            "group_size": 1,
+            "first_seen": timestamp,
+            "attack_pattern": None
+        }
+    
+    def get_group_summary(self, group_key: str) -> Optional[Dict[str, Any]]:
+        """Get summary of correlation group."""
+        if group_key not in self.alert_groups:
+            return None
+        
+        group = self.alert_groups[group_key]
+        metadata = self.group_metadata[group_key]
+        
+        # Calculate statistics
+        scores = [a.get("triage_score", 0.0) for a in group if "triage_score" in a]
+        avg_score = sum(scores) / len(scores) if scores else 0.0
+        max_score = max(scores) if scores else 0.0
+        
+        return {
+            "group_key": group_key,
+            "count": len(group),
+            "first_seen": metadata.get("first_seen"),
+            "last_seen": metadata.get("last_seen"),
+            "attack_pattern": metadata.get("attack_pattern"),
+            "correlation_type": metadata.get("correlation_type"),
+            "avg_score": round(avg_score, 3),
+            "max_score": round(max_score, 3),
+            "time_span_minutes": self._calculate_time_span(
+                metadata.get("first_seen"),
+                metadata.get("last_seen")
+            )
+        }
+    
+    def _calculate_time_span(self, first_seen: str, last_seen: str) -> Optional[int]:
+        """Calculate time span in minutes."""
+        try:
+            first_dt = datetime.fromisoformat(first_seen.replace("Z", "+00:00"))
+            last_dt = datetime.fromisoformat(last_seen.replace("Z", "+00:00"))
+            return int((last_dt - first_dt).total_seconds() / 60)
+        except Exception:
+            return None
+
+
+# Global correlation engine instance
+_correlation_engine: Optional[AlertCorrelationEngine] = None
+
+
+def get_correlation_engine() -> AlertCorrelationEngine:
+    """Get or create global correlation engine instance."""
+    global _correlation_engine
+    if _correlation_engine is None:
+        from src.common.config import CORRELATION_TIME_WINDOW_MINUTES
+        _correlation_engine = AlertCorrelationEngine(
+            time_window_minutes=CORRELATION_TIME_WINDOW_MINUTES
+        )
+    return _correlation_engine
+
+
+def correlate_alert(alert: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Correlate alert with existing groups.
+    
+    Args:
+        alert: Normalized alert dictionary
+        
+    Returns:
+        Correlation info dict
+    """
+    engine = get_correlation_engine()
+    return engine.correlate(alert)
+

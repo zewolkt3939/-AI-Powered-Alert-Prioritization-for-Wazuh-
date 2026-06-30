@@ -36,7 +36,7 @@ Wazuh API → Collector → Analyzer → Orchestrator → External systems (via 
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/lethanhsang188/ai-apw.git
+git clone https://github.com/zewolkt3939/-AI-Powered-Alert-Prioritization-for-Wazuh-.git
 cd ai-apw
 ```
 
